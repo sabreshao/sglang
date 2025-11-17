@@ -19,7 +19,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV BUILD_MOONCAKE="1"
+ENV BUILD_MOONCAKE="0"
 ENV AITER_COMMIT="v0.1.4"
 ENV NO_DEPS_FLAG=""
 ENV AITER_MXFP4_MOE_SF="0"
@@ -31,7 +31,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV BUILD_MOONCAKE="1"
+ENV BUILD_MOONCAKE="0"
 ENV AITER_COMMIT="v0.1.7.post1"
 ENV NO_DEPS_FLAG=""
 ENV AITER_MXFP4_MOE_SF="0"
@@ -43,7 +43,7 @@ ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
-ENV BUILD_MOONCAKE="1"
+ENV BUILD_MOONCAKE="0"
 ENV AITER_COMMIT="v0.1.7.post1"
 ENV NO_DEPS_FLAG=""
 ENV AITER_MXFP4_MOE_SF="1"
@@ -207,89 +207,6 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
-
-# Build and install sgl-router
-RUN python3 -m pip install --no-cache-dir setuptools-rust \
-    && cd /sgl-workspace/sglang/sgl-router \
-    && cargo build --release \
-    && python3 -m pip install --no-cache-dir . \
-    && rm -rf /root/.cache
-
-# -----------------------
-# TileLang
-ENV DEBIAN_FRONTEND=noninteractive
-ENV LIBGL_ALWAYS_INDIRECT=1
-RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
-
-RUN /bin/bash -lc 'set -euo pipefail; \
-  # Build TileLang only for gfx950
-  if [ "${GPU_ARCH:-}" != "gfx950" ]; then \
-    echo "[TileLang] Skipping (GPU_ARCH=${GPU_ARCH:-unset})"; \
-    exit 0; \
-  fi; \
-  echo "[TileLang] Building TileLang for ${GPU_ARCH}"; \
-  \
-  # System dependencies (NO llvm-dev to avoid llvm-config-16 shadowing)
-  apt-get update && apt-get install -y --no-install-recommends \
-      build-essential git wget curl ca-certificates gnupg \
-      libgtest-dev libgmock-dev \
-      libprotobuf-dev protobuf-compiler libgflags-dev libsqlite3-dev \
-      python3 python3-dev python3-setuptools python3-pip \
-      gcc libtinfo-dev zlib1g-dev libedit-dev libxml2-dev \
-      cmake ninja-build pkg-config libstdc++6 \
-  && rm -rf /var/lib/apt/lists/*; \
-  \
-  # Build GoogleTest static libs (Ubuntu package ships sources only)
-  cmake -S /usr/src/googletest -B /tmp/build-gtest -DBUILD_GTEST=ON -DBUILD_GMOCK=ON -DCMAKE_BUILD_TYPE=Release && \
-  cmake --build /tmp/build-gtest -j"$(nproc)" && \
-  cp -v /tmp/build-gtest/lib/*.a /usr/lib/x86_64-linux-gnu/ && \
-  rm -rf /tmp/build-gtest; \
-  \
-  # Keep setuptools < 80 (compat with base image)
-  python3 -m pip install --upgrade "setuptools>=77.0.3,<80" wheel cmake ninja && \
-  python3 -m pip cache purge || true; \
-  \
-  # Locate ROCm llvm-config; fallback to installing LLVM 18 if missing
-  LLVM_CONFIG_PATH=""; \
-  for p in /opt/rocm/llvm/bin/llvm-config /opt/rocm/llvm-*/bin/llvm-config /opt/rocm-*/llvm*/bin/llvm-config; do \
-    if [ -x "$p" ]; then LLVM_CONFIG_PATH="$p"; break; fi; \
-  done; \
-  if [ -z "$LLVM_CONFIG_PATH" ]; then \
-    echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh; \
-    chmod +x /tmp/llvm.sh; \
-    /tmp/llvm.sh 18; \
-    LLVM_CONFIG_PATH="$(command -v llvm-config-18)"; \
-    if [ -z "$LLVM_CONFIG_PATH" ]; then echo "ERROR: llvm-config-18 not found after install"; exit 1; fi; \
-  fi; \
-  echo "[TileLang] Using LLVM_CONFIG at: $LLVM_CONFIG_PATH"; \
-  export PATH="$(dirname "$LLVM_CONFIG_PATH"):/usr/local/bin:${PATH}"; \
-  export LLVM_CONFIG="$LLVM_CONFIG_PATH"; \
-  \
-  # Optional shim for tools that expect llvm-config-16
-  mkdir -p /usr/local/bin && \
-  printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
-  chmod +x /usr/local/bin/llvm-config-16; \
-  \
-  # TVM Python bits need Cython
-  python3 -m pip install --no-cache-dir "cython>=0.29.36,<3.0"; \
-  \
-  # Clone + pin TileLang (bundled TVM), then build
-  git clone --recursive --branch "${TILELANG_BRANCH}" "${TILELANG_REPO}" /opt/tilelang && \
-  cd /opt/tilelang && \
-  git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
-  git checkout -f "${TILELANG_COMMIT}" && \
-  git submodule update --init --recursive && \
-  export CMAKE_ARGS="-DLLVM_CONFIG=${LLVM_CONFIG} ${CMAKE_ARGS:-}" && \
-  bash ./install_rocm.sh'
-
-# -----------------------
-# Hadamard-transform (HIP build)
-RUN /bin/bash -lc 'set -euo pipefail; \
-    git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" fast-hadamard-transform; \
-    cd fast-hadamard-transform; \
-    git checkout -f "${FHT_COMMIT}"; \
-    python setup.py install'
 
 # -----------------------
 # Python tools

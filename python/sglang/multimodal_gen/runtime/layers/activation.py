@@ -74,6 +74,9 @@ class NewGELU(CustomOp):
 
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
+    
+    def forward_hip(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""

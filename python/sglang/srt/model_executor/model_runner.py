@@ -1821,6 +1821,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+        else:
+            self._dummy_run(batch_size=self.req_to_token_pool.size)
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
@@ -2083,6 +2085,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.lora_manager.prepare_lora_batch(forward_batch)
 
         self.attn_backend.init_forward_metadata(forward_batch)
+
+        if self.server_args.dump_model_arch and self.tp_rank == 0:
+            try:
+                from torchvista import trace_model
+
+                arch_inputs = (
+                    buffers.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
+                trace_model(
+                    self.model,
+                    arch_inputs,
+                    export_format=self.server_args.dump_model_arch_format,
+                    export_path=self.server_args.dump_model_arch_path,
+                    collapse_modules_after_depth=3,
+                    show_non_gradient_nodes=False,
+                    forced_module_tracing_depth=None,
+                    height=500
+                )
+                logger.info(
+                    "Dumped model architecture to %s (format=%s)",
+                    self.server_args.dump_model_arch_path,
+                    self.server_args.dump_model_arch_format,
+                )
+            except ImportError:
+                logger.warning(
+                    "dump_model_arch requested but torchvista not installed. "
+                    "Install with: pip install sglang[model_viz] or pip install torchvista"
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to dump model architecture: %s. Some model types (e.g. VLMs, PP) may not be supported.",
+                    e,
+                )
 
         def run_once():
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None

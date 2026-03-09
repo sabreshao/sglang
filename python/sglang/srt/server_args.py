@@ -667,6 +667,11 @@ class ServerArgs:
     debug_tensor_dump_output_folder: Optional[str] = None
     # None means dump all layers.
     debug_tensor_dump_layers: Optional[List[int]] = None
+
+    # Model architecture dump (TorchVista)
+    dump_model_arch: bool = False
+    dump_model_arch_path: str = "model_arch.html"
+    dump_model_arch_format: str = "html"
     # TODO(guoyuhong): clean the old dumper code.
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
@@ -1329,6 +1334,9 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        
+        print(f"sabre model arch")
+        print(model_arch)
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -5220,6 +5228,25 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+        parser.add_argument(
+            "--dump-model-arch",
+            action="store_true",
+            default=ServerArgs.dump_model_arch,
+            help="Dump model architecture visualization (HTML/PNG/SVG) after load. Requires: pip install sglang[model_viz] or pip install torchvista",
+        )
+        parser.add_argument(
+            "--dump-model-arch-path",
+            type=str,
+            default=ServerArgs.dump_model_arch_path,
+            help="Output path for model architecture dump. Default: model_arch.html",
+        )
+        parser.add_argument(
+            "--dump-model-arch-format",
+            type=str,
+            default=ServerArgs.dump_model_arch_format,
+            choices=["html", "png", "svg"],
+            help="Export format for model architecture dump.",
         )
 
         # PD disaggregation

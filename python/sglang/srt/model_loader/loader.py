@@ -261,6 +261,9 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    print(f"sabre init model")
+    print(model_class)
+
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,

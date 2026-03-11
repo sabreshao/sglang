@@ -63,6 +63,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+import rocm_halcyon as rh
+from rocm_halcyon import ModuleAnnotator
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
@@ -89,10 +92,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
-def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
+def start_profile(profile_activities, profile_record_shapes=False, rank_print=print, model=None):
     """
-    Abstracted function to start profiling based on profile_activities.
-    Returns profiler object (or None).
+    Create profiler object based on profile_activities without starting it.
+    Returns profiler object (or None) or "CUDA_PROFILER" string for CUDA profiler.
     """
     if "CUDA_PROFILER" in profile_activities:
         try:
@@ -100,7 +103,7 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
             rank_print("CUDA Profiler started (nsys will begin capturing)")
         except Exception as e:
             rank_print(f"Failed to start CUDA profiler: {e}")
-        return None
+        return "CUDA_PROFILER"
     else:
         activities = []
         if "CPU" in profile_activities:
@@ -115,7 +118,6 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
                 with_stack=True,
                 record_shapes=profile_record_shapes,
             )
-            profiler.start()
             return profiler
         return None
 
@@ -452,9 +454,15 @@ def _create_torch_profiler_filename(
     profile_filename_prefix, batch_size, input_len, output_len, stage
 ):
     output_dir = _get_torch_profiler_output_dir()
-    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json.gz"
+    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.trace.json"
     return os.path.join(output_dir, filename)
 
+def _create_excel_filename(
+    profile_filename_prefix, batch_size, input_len, output_len, stage
+):
+    output_dir = _get_torch_profiler_output_dir()
+    filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_{stage}.xlsx"
+    return os.path.join(output_dir, filename)
 
 def _save_profile_trace_results(profiler, filename):
     parent_dir = os.path.dirname(os.path.abspath(filename))
@@ -558,33 +566,50 @@ def latency_test_run_once(
 
     tot_latency = 0
 
-    profiler = None
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
-    if enable_profile_prefill:
-        profiler = start_profile(
-            profile_activities,
-            profile_record_shapes=profile_record_shapes,
-            rank_print=rank_print,
-        )
+    profiler = start_profile(
+        profile_activities,
+        profile_record_shapes=profile_record_shapes,
+        rank_print=rank_print,
+        model=model_runner.model,
+    ) if enable_profile_prefill else None
 
     synchronize(device)
     tic = time.perf_counter()
-    next_token_ids, _, batch = extend(reqs, model_runner)
+
+    # Execute prefill with or without profiling
+    if enable_profile_prefill and profiler is not None and profiler != "CUDA_PROFILER":
+        # Use profiler as context manager with ModuleAnnotator
+        with profiler:
+            with ModuleAnnotator(model_runner.model):
+                next_token_ids, _, batch = extend(reqs, model_runner)
+    else:
+        # No profiling or CUDA profiler (already started)
+        next_token_ids, _, batch = extend(reqs, model_runner)
+
     synchronize(device)
     prefill_latency = time.perf_counter() - tic
 
+    # Save profiling results if enabled
     if enable_profile_prefill:
         trace_filename = _create_torch_profiler_filename(
             profile_filename_prefix, batch_size, input_len, output_len, "prefill"
         )
-        stop_profile(
-            profiler,
-            profile_activities,
-            rank_print=rank_print,
-            save_trace=True,
-            trace_filename=trace_filename,
-            stage="prefill",
-        )
+        if profiler == "CUDA_PROFILER":
+            # Handle CUDA profiler stop
+            stop_profile(
+                None,
+                profile_activities,
+                rank_print=rank_print,
+                save_trace=True,
+                trace_filename=trace_filename,
+                stage="prefill",
+            )
+        elif profiler is not None:
+            # Save torch profiler trace
+            _save_profile_trace_results(profiler, trace_filename)
+            rank_print(f"torch profiler chrome trace for prefill saved to {trace_filename}")
+            generate_excel_from_trace(trace_filename, _create_excel_filename(profile_filename_prefix, batch_size, input_len, output_len, "prefill"))
 
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
@@ -601,16 +626,27 @@ def latency_test_run_once(
     )
     profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
-    profiler = None
+    decode_profiler = None
+    module_annotator = None
+    profiler_active = False
+
     for i in range(output_len - 1):
         synchronize(device)
+
         # Start profiler at the specified step
         if enable_profile_decode and i == profile_start:
-            profiler = start_profile(
+            decode_profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
+                model=model_runner.model,
             )
+            if decode_profiler is not None and decode_profiler != "CUDA_PROFILER":
+                # Enter profiler and module annotator contexts
+                decode_profiler.__enter__()
+                module_annotator = ModuleAnnotator(model_runner.model)
+                module_annotator.__enter__()
+                profiler_active = True
 
         tic = time.perf_counter()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
@@ -618,19 +654,33 @@ def latency_test_run_once(
         latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+        if enable_profile_decode and decode_profiler is not None and i >= profile_end - 1:
+            if profiler_active:
+                # Exit module annotator and profiler contexts
+                module_annotator.__exit__(None, None, None)
+                decode_profiler.__exit__(None, None, None)
+                profiler_active = False
+
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
-            stop_profile(
-                profiler,
-                profile_activities,
-                rank_print=rank_print,
-                save_trace=True,
-                trace_filename=trace_filename,
-                stage="decode",
-            )
-            profiler = None
+            if decode_profiler == "CUDA_PROFILER":
+                # Handle CUDA profiler stop
+                stop_profile(
+                    None,
+                    profile_activities,
+                    rank_print=rank_print,
+                    save_trace=True,
+                    trace_filename=trace_filename,
+                    stage="decode",
+                )
+            else:
+                # Save torch profiler trace
+                _save_profile_trace_results(decode_profiler, trace_filename)
+                rank_print(f"torch profiler chrome trace for decode saved to {trace_filename}")
+                generate_excel_from_trace(trace_filename, _create_excel_filename(profile_filename_prefix, batch_size, input_len, output_len, "decode"))
+
+            decode_profiler = None
 
         tot_latency += latency
         throughput = batch_size / latency
@@ -656,7 +706,58 @@ def latency_test_run_once(
     )
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
+
     return measurement_results
+
+def generate_excel_from_trace(trace_filename, excel_file):
+    trace_file = trace_filename
+    #prof.export_chrome_trace(trace_file)
+    #print(f"Trace exported to: {trace_file}")
+
+    # Parse trace with rocm-halcyon
+    print(f"Parsing trace file...")
+    device_type = "nv" if torch.cuda.is_available() else "amd"
+    kernels = rh.parse_torch_profiler(trace_file, device_type=device_type)
+
+    # Export to Excel with module information columns
+    print(f"Exporting to Excel...")
+
+    rh.export_to_excel(kernels, {
+        # GPU/CPU operation names
+        "gpu_kernel_name": rh.GPUKernelNameVisitor(),
+        "cpu_op_name": rh.CPUKernelNameVisitor(),
+
+        # NEW: Module architecture information
+        "module_name": rh.ModuleNameVisitor(),           # Full module path
+        "module_type": rh.ModuleTypeVisitor(),           # Module class name
+        "module_hierarchy": rh.ModuleHierarchyVisitor(), # Readable hierarchy
+        "module_depth": rh.ModuleDepthVisitor(),         # Nesting level
+        "parent_module": rh.ParentModuleVisitor(),       # Parent module path
+
+        # Performance metrics
+        "duration_us": rh.KernelDurationVisitor(),
+        "bandwidth_GB/s": rh.BWVsitor(),
+
+        # Kernel configuration
+        "grid": rh.KernelGridSizeVisitor(),
+        "block": rh.KernelBlockSizeVisitor(),
+        "smem": rh.KernelSharedMemorySizeVisitor(),
+
+        # Data shapes and types
+        "input_shape": rh.KernelInputShapeVisitor(),
+        "input_dtype": rh.KernelInputDtypeVisitor(),
+        "output_shape": rh.KernelOutputShapeVisitor(),
+        "output_dtype": rh.KernelOutputDtypeVisitor(),
+
+        # Timing information
+        "start_timestamp": rh.KernelStartTimestampVisitor(),
+        "end_timestamp": rh.KernelEndTimestampVisitor(),
+        "gap_us": rh.KernelGapVisitor(),
+
+        # Device information
+        "stream": rh.KernelStreamIdVisitor(),
+        "device": rh.KernelDeviceVisitor(),
+    }, file_name=excel_file, sheet_name="kernels_with_modules")
 
 
 def latency_test(

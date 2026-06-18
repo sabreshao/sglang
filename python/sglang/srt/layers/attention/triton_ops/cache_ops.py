@@ -16,13 +16,19 @@ def concat_and_cast_mha_k_kernel(
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     head_range = tl.arange(0, head_cnt)
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    # tl.arange requires a power-of-2 range; nope_dim/rope_dim may not be powers
+    # of 2 (e.g. GLM-5.1 DSA qk_nope_head_dim=192). Use padded power-of-2 blocks
+    # with masking so non-power-of-2 head dims compile and stay correct.
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_offs < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -32,14 +38,15 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    src_nope = tl.load(src_nope_ptr, mask=nope_mask[None, :], other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=nope_mask[None, :])
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_mask = rope_offs < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
+    src_rope = tl.load(src_rope_ptr, mask=rope_mask[None, :], other=0.0)
+    tl.store(dst_rope_ptr, src_rope, mask=rope_mask[None, :])
 
 
 def concat_and_cast_mha_k_triton(
@@ -77,6 +84,8 @@ def concat_and_cast_mha_k_triton(
         k_rope.stride(0),
         nope_dim,
         rope_dim,
+        triton.next_power_of_2(nope_dim),
+        triton.next_power_of_2(rope_dim),
     )
 
 

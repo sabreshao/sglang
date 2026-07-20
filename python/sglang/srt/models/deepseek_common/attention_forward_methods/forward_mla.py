@@ -51,6 +51,31 @@ from sglang.srt.utils import BumpAllocator
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
+# --- index-share engagement instrumentation (env-gated, GLM-5.1-safe no-op by default) ---
+import logging as _idx_logging
+import os as _idx_os
+
+_idx_logger = _idx_logging.getLogger("sglang.indexer_engage")
+_INDEXER_ENGAGE_SEEN = set()
+
+
+def _log_indexer_engage(layer_id, skip_topk, is_nextn, topk_indices):
+    if _idx_os.environ.get("SGLANG_LOG_INDEXER_ENGAGE", "0") != "1":
+        return
+    try:
+        key = (int(layer_id), bool(skip_topk))
+    except Exception:
+        return
+    if key in _INDEXER_ENGAGE_SEEN:
+        return
+    _INDEXER_ENGAGE_SEEN.add(key)
+    shape = tuple(topk_indices.shape) if topk_indices is not None else None
+    _idx_logger.info(
+        "[INDEXER-ENGAGE] layer=%s skip_topk=%s is_nextn=%s topk_shape=%s nonNone=%s",
+        layer_id, bool(skip_topk), bool(is_nextn), shape, topk_indices is not None,
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -301,6 +326,14 @@ class DeepseekMLAForwardMixin:
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+
+        if getattr(self, "use_dsa", False):
+            _log_indexer_engage(
+                getattr(self, "layer_id", -1),
+                getattr(self, "skip_topk", None),
+                getattr(self, "is_nextn", False),
+                topk_indices,
+            )
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)

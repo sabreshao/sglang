@@ -296,8 +296,10 @@ def _quantize_k_cache_fast_kernel(
 
         y = tl.load(ptr, mask=mask, other=0.0).to(tl.float32)
 
-        # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
+        # eps guard restored: degenerate all-zero tile -> max(abs)=0 -> y_s=0 -> 1/0=inf -> 0*inf=NaN.
+        # Guarding y_s away from 0 keeps degenerate tiles at 0 (0*eps=0) instead of NaN. No-op for normal tiles.
         y_s = tl.max(tl.abs(y)) / FP8_MAX
+        y_s = tl.maximum(y_s, 1e-12)
         y_s_inv = 1.0 / y_s
         y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
             output_nope_q_ptr.dtype.element_ty

@@ -3,6 +3,7 @@
 Split-K flash-decode over the indexer top-2048; per-query grid (CP-safe).
 DSA fp8 KV pool: 576-wide raw fp8_e4m3fn [512 nope | 64 rope], kv_scale==1.0.
 Q bf16 (a16w8). K/V dequant = fp8->bf16. MLA: V = nope(512).
+By default PV uses bf16 probabilities for accuracy; FP8 PV is an opt-in speed path.
 """
 
 import torch
@@ -113,7 +114,7 @@ def _splitk_combine_kernel(
 
 def triton_sparse_mla_decode_fp8(
     q_nope, q_rope, kv_cache, kv_indices, sm_scale,
-    out=None, TOPK=None, BLOCK_H=64, K_SPLITS=8, USE_FP8_PV=True,
+    out=None, TOPK=None, BLOCK_H=64, K_SPLITS=8, USE_FP8_PV=False,
 ):
     S, H, D_V = q_nope.shape
     D_TAIL = q_rope.shape[-1]

@@ -64,7 +64,12 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 import os as _os  # PATCH_TRITONFP8
-_DSA_TRITON_FP8_DECODE = _os.environ.get("SGLANG_DSA_TRITON_FP8_DECODE", "0") == "1"  # PATCH_TRITONFP8
+_DSA_TRITON_FP8_DECODE = _os.environ.get(
+    "SGLANG_DSA_TRITON_FP8_DECODE", "1"
+).lower() not in ("0", "false", "off", "no")  # PATCH_TRITONFP8
+_DSA_TRITON_FP8_PV = _os.environ.get(
+    "SGLANG_DSA_TRITON_FP8_PV", "0"
+).lower() in ("1", "true", "on", "yes")  # PATCH_TRITONFP8
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -1696,6 +1701,13 @@ class DeepseekSparseAttnBackend(
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self._should_use_fp8_cp_safe_mla(kv_cache, layer):
+                return self._forward_fp8_cp_safe_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    layer=layer,
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1890,6 +1902,13 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self._should_use_fp8_cp_safe_mla(kv_cache, layer):
+                return self._forward_fp8_cp_safe_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    layer=layer,
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2158,6 +2177,61 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    def _should_use_fp8_cp_safe_mla(
+        self, kv_cache: torch.Tensor, layer: RadixAttention
+    ) -> bool:
+        if (
+            not _DSA_TRITON_FP8_DECODE
+            or not _is_hip
+            or not is_dsa_enable_prefill_cp()
+            or self.need_pad_heads
+        ):
+            return False
+
+        if kv_cache.dtype != fp8_dtype or self.dsa_kv_cache_store_fp8:
+            return False
+
+        # HIP DSA raw-FP8 stores [nope | rope] with no FlashMLA scale tail.
+        return kv_cache.shape[-1] == layer.head_dim
+
+    def _forward_fp8_cp_safe_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_fp8,
+        )
+
+        q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        out_dtype = torch.bfloat16 if q.dtype == fp8_dtype else q.dtype
+        if layer.head_dim != layer.v_head_dim:
+            o = torch.empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                device=q.device,
+                dtype=out_dtype,
+            )
+        else:
+            o = torch.empty_like(q, dtype=out_dtype)
+
+        q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if q_kernel.dtype == fp8_dtype:
+            q_kernel = q_kernel.to(torch.bfloat16)
+        o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        v_dim = layer.v_head_dim
+        triton_sparse_mla_decode_fp8(
+            q_kernel[..., :v_dim].contiguous(),
+            q_kernel[..., v_dim:].contiguous(),
+            kv_cache,
+            page_table_1,
+            layer.scaling,
+            out=o_kernel,
+            USE_FP8_PV=_DSA_TRITON_FP8_PV,
+        )
+        return o
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -2189,27 +2263,13 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        if (  # PATCH_TRITONFP8: fp8+CP -> per-query Triton kernel (656-native)
-            _DSA_TRITON_FP8_DECODE
-            and _is_hip
-            and kv_cache.dtype == fp8_dtype
-            and is_dsa_enable_prefill_cp()
-            and not self.need_pad_heads
-        ):
-            from sglang.srt.layers.attention.dsa.triton_sparse_mla_decode import (
-                triton_sparse_mla_decode_fp8,
+        if self._should_use_fp8_cp_safe_mla(kv_cache, layer):
+            return self._forward_fp8_cp_safe_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
             )
-
-            _d_v = layer.v_head_dim
-            triton_sparse_mla_decode_fp8(
-                q_kernel[..., :_d_v].contiguous(),
-                q_kernel[..., _d_v:].contiguous(),
-                kv_cache,
-                page_table_1,
-                layer.scaling,
-                out=o_kernel,
-            )
-            return o
 
         q_scale = None
         kv_scale = None
@@ -2289,27 +2349,13 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-        if (  # PATCH_TRITONFP8: fp8+CP -> per-query Triton kernel (656-native)
-            _DSA_TRITON_FP8_DECODE
-            and _is_hip
-            and kv_cache.dtype == fp8_dtype
-            and is_dsa_enable_prefill_cp()
-            and not self.need_pad_heads
-        ):
-            from sglang.srt.layers.attention.dsa.triton_sparse_mla_decode import (
-                triton_sparse_mla_decode_fp8,
+        if self._should_use_fp8_cp_safe_mla(kv_cache, layer):
+            return self._forward_fp8_cp_safe_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                layer=layer,
             )
-
-            _d_v = layer.v_head_dim
-            triton_sparse_mla_decode_fp8(
-                q_kernel[..., :_d_v].contiguous(),
-                q_kernel[..., _d_v:].contiguous(),
-                kv_cache,
-                page_table_1,
-                layer.scaling,
-                out=o_kernel,
-            )
-            return o
 
         q_scale = None
         kv_scale = None

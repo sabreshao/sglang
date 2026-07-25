@@ -67,7 +67,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="9127c94a18e4398e1eba91f6639e910f0994ad02"
+ENV AITER_COMMIT_DEFAULT="5bd9adf3d3c9ba8cf5b9e5fbc6826d2ce54688bf"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -250,6 +250,16 @@ RUN cd aiter \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
+
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
+
+RUN echo "========== [Parallel] Building RCCL ==========" && \
+    pip install cmake && \
+    git clone "$RCCL_REPO" /app/rccl && \
+    cd /app/rccl && \
+    git checkout "$RCCL_BRANCH" && \
+    ./install.sh -p --amdgpu_targets=$GPU_ARCH_LIST
 
 # -----------------------
 # Build Mooncake

@@ -521,7 +521,9 @@ class DeepseekMLAForwardMixin:
                 q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
-        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
+        skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused(
+            forward_batch
+        )
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
@@ -609,7 +611,10 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused(forward_batch)
+                and self.rotary_emb is not None
+            ):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
                 kv_cache_dtype = (
@@ -1004,12 +1009,20 @@ class DeepseekMLAForwardMixin:
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
-    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_tilelang_fused(
+        self: DeepseekV2AttentionMLA, forward_batch=None
+    ) -> bool:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang DSA on gfx95.
+
+        NOTE(cp): The fused kernel applies RoPE and writes the KV cache using
+        the *local* ``positions`` / ``out_cache_loc``. Under prefill CP the keys
+        are all-gathered to the *full* sequence length **before** the fused kernel
+        would run, so deferring RoPE to it would apply RoPE to full-length keys with
+        local (strided, 1/cp_size-length) positions and corrupt the cache.
         """
         server_args = get_server_args()
-        return (
+        base = (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")
             and (
@@ -1017,6 +1030,13 @@ class DeepseekMLAForwardMixin:
                 or server_args.dsa_prefill_backend == "tilelang"
             )
         )
+        if not base:
+            return False
+        if forward_batch is not None and (
+            dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+        ):
+            return False
+        return True
 
     def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
         """

@@ -1,1 +1,2 @@
-docker build --build-arg SGL_BRANCH=v0.5.15.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t sabreshao/sglang:v0.5.15.post1-rocm720-mi35x -f rocm.Dockerfile .
+docker build \
+  --build-arg SGL_BRANCH=refactor/amd-glm5x-cp-eagle-20260723 --build-arg SGL_REPO=https://github.com/AFDEAPAC/sglang --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t sabreshao/sglang:cp-eagle-0725 -f rocm.Dockerfile .

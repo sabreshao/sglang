@@ -690,10 +690,14 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                # The DSV4 silu_and_mul_clamp kernel is CUDA/XPU-only.
+                # Clamp the gate/up buffer explicitly, then use the regular
+                # HIP silu_and_mul kernel.
+                intermediate_cache1.clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
             else:
-                assert (
-                    _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:

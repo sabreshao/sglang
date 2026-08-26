@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL_PATH="${MODEL_PATH:-/models/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
+PORT="${PORT:-8012}"
+
+exec env SGLANG_DSV4_FP4_DEQUANT=1 sglang serve \
+  --trust-remote-code \
+  --model-path "${MODEL_PATH}" \
+  --served-model-name DeepSeek-V4-Flash-0731 \
+  --tp 8 \
+  --moe-runner-backend triton \
+  --attention-backend dsv4 \
+  --page-size 256 \
+  --mem-fraction-static 0.90 \
+  --context-length 4096 \
+  --swa-full-tokens-ratio 0.1 \
+  --disable-shared-experts-fusion \
+  --kv-cache-dtype fp8_e4m3 \
+  --chunked-prefill-size 8192 \
+  --cuda-graph-backend-decode disabled \
+  --cuda-graph-backend-prefill disabled \
+  --host 0.0.0.0 \
+  --port "${PORT}"

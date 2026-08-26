@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/models/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062}"
+MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash-0731}"
+export HF_HOME="${HF_HOME:-/models}"
 PORT="${PORT:-8012}"
 
+# DSV4 prefill graph is incompatible with LogitsProcessorOutput here.
 exec env SGLANG_DSV4_FP4_DEQUANT=1 sglang serve \
   --trust-remote-code \
-  --model-path "${MODEL_PATH}" \
+  --model-path "${MODEL_NAME}" \
   --served-model-name DeepSeek-V4-Flash-0731 \
   --tp 8 \
-  --moe-runner-backend triton \
+  --moe-runner-backend auto \
   --attention-backend dsv4 \
   --page-size 256 \
   --mem-fraction-static 0.90 \
@@ -18,7 +20,7 @@ exec env SGLANG_DSV4_FP4_DEQUANT=1 sglang serve \
   --disable-shared-experts-fusion \
   --kv-cache-dtype fp8_e4m3 \
   --chunked-prefill-size 8192 \
-  --cuda-graph-backend-decode disabled \
+  --cuda-graph-backend-decode full \
   --cuda-graph-backend-prefill disabled \
   --host 0.0.0.0 \
   --port "${PORT}"

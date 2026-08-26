@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODEL_NAME="${MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash-0731}"
 export HF_HOME="${HF_HOME:-/models}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-/models}"
 PORT="${PORT:-8012}"
 
 # DSV4 prefill graph is incompatible with LogitsProcessorOutput here.
@@ -22,5 +23,7 @@ exec env SGLANG_DSV4_FP4_DEQUANT=1 sglang serve \
   --chunked-prefill-size 8192 \
   --cuda-graph-backend-decode full \
   --cuda-graph-backend-prefill disabled \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
   --host 0.0.0.0 \
   --port "${PORT}"

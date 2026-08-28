@@ -1273,6 +1273,9 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Set True to requantize FP4 experts to per-channel-weight FP8 for Triton
+    # MoE. This is experimental and intentionally opt-in.
+    SGLANG_DSV4_FP4_PTPC = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches

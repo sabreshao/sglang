@@ -222,6 +222,44 @@ def cast_e2m1fn_to_e4m3fn(
     )
 
 
+def cast_e2m1fn_to_e4m3fn_per_channel(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize packed DSV4 FP4 and requantize it per output channel.
+
+    DSV4 stores two E2M1 values per byte and one E8M0/FP32 scale for every
+    group of 32 input values. Triton PTPC expects ordinary FP8 weights and one
+    FP32 scale per output channel, so the original group scales are folded
+    into the dequantized row before requantization.
+    """
+    assert x.dtype == torch.int8
+    assert x.ndim == 2
+    out_dim, packed_in_dim = x.shape
+    in_dim = packed_in_dim * 2
+    fp4_group_size = 32
+    assert in_dim % fp4_group_size == 0
+    assert scale.shape == (out_dim, in_dim // fp4_group_size)
+
+    packed = x.view(torch.uint8)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    table = DSV4_DEQUANT_FP4_TABLE.to(x.device)
+    dequantized = torch.stack(
+        [table[low.long()], table[high.long()]], dim=-1
+    ).flatten(1)
+    dequantized = dequantized * scale.float().repeat_interleave(
+        fp4_group_size, dim=1
+    )
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    channel_scale = dequantized.abs().amax(dim=1, keepdim=True) / fp8_max
+    channel_scale = channel_scale.clamp_min(torch.finfo(torch.float32).tiny)
+    quantized = torch.clamp(
+        dequantized / channel_scale, -fp8_max, fp8_max
+    ).to(torch.float8_e4m3fn)
+    return quantized, channel_scale
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -234,6 +272,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        dequant_fp4_to_ptpc: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -241,6 +280,7 @@ class Fp8Config(QuantizationConfig):
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.dequant_fp4_to_fp8 = False
+        self.dequant_fp4_to_ptpc = dequant_fp4_to_ptpc
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -1081,6 +1121,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
+        self.dequant_fp4_to_ptpc = self.quant_config.dequant_fp4_to_ptpc
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -1452,10 +1493,60 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.is_shuffled = False
         logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
+    def _dequantize_fp4_experts_to_ptpc(self, layer: Module) -> None:
+        if not (self.is_fp4_expert and self.dequant_fp4_to_ptpc):
+            return
+
+        for weight_param, scale_param in [
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        ]:
+            new_weights = []
+            new_scales = []
+            for expert_id in range(weight_param.shape[0]):
+                weight, scale = cast_e2m1fn_to_e4m3fn_per_channel(
+                    weight_param.data[expert_id], scale_param.data[expert_id]
+                )
+                new_weights.append(weight)
+                new_scales.append(scale)
+            weight_param.data = torch.stack(new_weights)
+            scale_param.data = torch.stack(new_scales).float()
+            scale_param.format_ue8m0 = False
+
+        self.is_fp4_expert = False
+        layer.w13_weight.is_shuffled = False
+        layer.w2_weight.is_shuffled = False
+        logger.warning_once(
+            "Dequantized FP4 expert weights to per-channel FP8 for Triton MoE."
+        )
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # Dequantize before the AMD FP4/AITER branch. That branch returns after
         # packing and shuffling FP4 weights, which would bypass DEQUANT.
+        self._dequantize_fp4_experts_to_ptpc(layer)
         self._dequantize_fp4_experts_to_fp8(layer)
+
+        if self.dequant_fp4_to_ptpc:
+            if _is_fp8_fnuz:
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+            return
 
         runner_is_aiter = (
             getattr(self, "runner", None) is not None
@@ -2378,9 +2469,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w2_scale=(
                 layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
             ),
+            per_channel_quant=self.dequant_fp4_to_ptpc,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            block_shape=self.weight_block_size,
+            block_shape=None if self.dequant_fp4_to_ptpc else self.weight_block_size,
         )
 
     def apply(

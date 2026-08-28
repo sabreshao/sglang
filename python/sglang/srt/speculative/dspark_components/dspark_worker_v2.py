@@ -389,9 +389,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            self._draft_worker.init_cuda_graphs(
-                capture_decode_cuda_graph=capture_decode_cuda_graph
-            )
+            # The draft checkpoint can retain trainable parameters (notably
+            # when it shares the target embedding/LM head).  CUDA-graph
+            # capture is inference-only, and Triton/AITER MoE reductions use
+            # out= buffers that reject autograd-tracked inputs.
+            with torch.inference_mode():
+                self._draft_worker.init_cuda_graphs(
+                    capture_decode_cuda_graph=capture_decode_cuda_graph
+                )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(

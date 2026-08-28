@@ -50,6 +50,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.runtime_context import (
     configured_moe_dp_size,
     get_exec,
+    get_flags,
     get_model,
     get_parallel,
     get_server_args,
@@ -85,6 +86,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
     install_shared_experts_fusion_decision,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -263,6 +265,19 @@ def _get_quantization_config(
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            quant_config.dequant_fp4_to_ptpc = (
+                model_config.is_fp4_experts
+                and envs.SGLANG_DSV4_FP4_PTPC.get()
+            )
+            if quant_config.dequant_fp4_to_ptpc:
+                moe_flags = get_flags().moe
+                if moe_flags.runner_backend != MoeRunnerBackend.TRITON:
+                    logger.warning(
+                        "SGLANG_DSV4_FP4_PTPC requires the Triton MoE runner; "
+                        "overriding moe_runner_backend=%s with triton.",
+                        moe_flags.runner_backend,
+                    )
+                    moe_flags.runner_backend = MoeRunnerBackend.TRITON
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:

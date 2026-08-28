@@ -128,7 +128,7 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_va
 )
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_shuffle_moe_mxfp4 = is_gfx95_supported() or _is_hip  # gfx942: shuffle MXFP4 MoE weights so the FlyDSL a8w4/a16w4 path (is_shuffled) engages
 
 
 def _require_fp4_dtype():
@@ -1514,6 +1514,79 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     new_s2, requires_grad=False
                 )
 
+            # gfx942 (MI30x): the fp4 (E2M1) MoE GEMM kernels are broken/absent on
+            # gfx942 (CK-Tile A16W4 numerically wrong; fp4-activation quant unimplemented;
+            # afp8_wfp4 FlyDSL is gfx950-only). Convert MXFP4 (E2M1 + E8M0 microscale) to
+            # int4 [-7,7] + bf16 groupwise scale and use the FlyDSL a16wi4 (int4_bf16) path,
+            # which is numerically exact on gfx942 (validated logits_diff ~3e-5).
+            if _is_hip and get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true"):
+                logger.info(
+                    "[GFX942-INT4] converting MXFP4 MoE -> int4 a16wi4 (w13=%s w2=%s)",
+                    tuple(layer.w13_weight.shape),
+                    tuple(layer.w2_weight.shape),
+                )
+                from aiter import dtypes as _adt
+                from aiter.ops.quant import per_1x32_i4_quant
+                from aiter.ops.shuffle import (
+                    pack_int8_to_packed_int4,
+                    shuffle_scale_for_int4,
+                )
+                from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+
+                def _mxfp4_to_int4_a16wi4(w_packed, scale_e8m0):
+                    Ee, Nn, Kp = w_packed.shape
+                    Kk = Kp * 2
+                    w_u8 = w_packed.view(torch.uint8)
+                    sc_u8 = scale_e8m0.view(torch.uint8)
+                    w_i8_full = torch.empty(
+                        (Ee, Nn, Kk), dtype=_adt.i8, device=w_packed.device
+                    )
+                    bscale_full = torch.empty(
+                        (Ee, Kk // 32, Nn), dtype=torch.bfloat16, device=w_packed.device
+                    )
+                    step = 16
+                    for e0 in range(0, Ee, step):
+                        e1 = min(e0 + step, Ee)
+                        w_f32 = mxfp4_to_f32(w_u8[e0:e1].clone()).view(e1 - e0, Nn, Kk)
+                        sc = e8m0_to_f32(sc_u8[e0:e1]).view(e1 - e0, Nn, Kk // 32)
+                        w_deq = (
+                            w_f32.view(e1 - e0, Nn, Kk // 32, 32) * sc.unsqueeze(-1)
+                        ).view(e1 - e0, Nn, Kk).to(torch.bfloat16)
+                        del w_f32, sc
+                        w_i8_c, bscale_c = per_1x32_i4_quant(w_deq)
+                        del w_deq
+                        w_i8_full[e0:e1] = w_i8_c
+                        bscale_full[e0:e1] = bscale_c
+                        del w_i8_c, bscale_c
+                    w_i4 = w_i8_full.view(_adt.i4x2)
+                    w_shuf = pack_int8_to_packed_int4(
+                        shuffle_weight(w_i4.view(_adt.i8), (16, 16))
+                    )
+                    w_shuf = w_shuf.view(Ee, Nn, Kk // 2).view(_adt.i4x2)
+                    del w_i8_full, w_i4
+                    sc_shuf = (
+                        shuffle_scale_for_int4(bscale_full, group_size=32)
+                        .view(-1)
+                        .contiguous()
+                    )
+                    return w_shuf, sc_shuf
+
+                w13_w, w13_s = _mxfp4_to_int4_a16wi4(
+                    layer.w13_weight.data, layer.w13_weight_scale_inv.data
+                )
+                w2_w, w2_s = _mxfp4_to_int4_a16wi4(
+                    layer.w2_weight.data, layer.w2_weight_scale_inv.data
+                )
+                layer.w13_weight = torch.nn.Parameter(w13_w, requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(w2_w, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_s, requires_grad=False
+                )
+                layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s, requires_grad=False)
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+                return
+
             for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
@@ -2683,9 +2756,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             if self.is_fp4_expert:
-                fp4_weight_dtype = _require_fp4_dtype()
-                w13_weight = w13_weight.view(fp4_weight_dtype)
-                w2_weight = w2_weight.view(fp4_weight_dtype)
+                if _is_hip and get_bool_env_var("SGLANG_GFX942_MXFP4_INT4", "true"):
+                    from aiter import dtypes as _adt
+
+                    w13_weight = w13_weight.view(_adt.i4x2)
+                    w2_weight = w2_weight.view(_adt.i4x2)
+                else:
+                    fp4_weight_dtype = _require_fp4_dtype()
+                    w13_weight = w13_weight.view(fp4_weight_dtype)
+                    w2_weight = w2_weight.view(fp4_weight_dtype)
                 if getattr(layer.w13_weight, "is_shuffled", False):
                     w13_weight.is_shuffled = True
                     w2_weight.is_shuffled = True

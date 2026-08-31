@@ -97,8 +97,9 @@ class _MXFP4QuantizedData(MXFP4QuantizeUtil):
         self.quantized_data = quantized_data
 
 
-# Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
-# projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
+# Force the AITER CK path (not Triton) for dense w8a8-block GEMMs (MLA q/kv/o
+# projections), to match ATOM. On gfx95 this also selects the CK bpreshuffle
+# path; on other AMD architectures it selects the regular AITER CK path.
 # Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
 # SGLANG_FORCE_CK_W8A8=1 still works as an override.
 _FORCE_CK_W8A8: bool = False
@@ -188,6 +189,22 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
         (8192, 1024),
         (8192, 32768),
     ]
+
+
+def _aiter_w8a8_use_triton(n: int, k: int, m: int) -> bool:
+    """Return whether an AITER FP8 GEMM must use the Triton fallback."""
+    if _use_aiter_bpreshuffle_gfx95:
+        return use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    if _use_aiter_gfx95:
+        # ROCm < 7.2 gfx95 has shape- and M-dependent CK NaN cases.
+        ck_safe_m = _AITER_GFX95_CK_W8A8_MAX_SAFE_M.get((n, k))
+        return use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
+            ck_safe_m is not None and m > ck_safe_m
+        )
+    # AITER is the selected backend on gfx942 and other AMD architectures.
+    # Use its regular CK blockscale operator; the Triton fallback here used to
+    # be unconditional, making --fp8-gemm-backend=aiter ineffective on gfx942.
+    return False
 
 
 if _use_aiter:
@@ -1179,18 +1196,7 @@ def aiter_w8a8_block_fp8_linear(
 
     n, k = weight.shape
 
-    if _use_aiter_bpreshuffle_gfx95:
-        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
-    elif _use_aiter_gfx95:
-        # gfx95 on ROCm < 7.2: keep the (faster) CK path at/below the per-shape
-        # CK-safe M bound; above it, ck_gemm_a8w8_blockscale returns NaN, so use
-        # Triton. Unlisted shapes keep their original decision. Fixed in ROCm 7.2.
-        _ck_safe_m = _AITER_GFX95_CK_W8A8_MAX_SAFE_M.get((n, k))
-        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
-            _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
-        )
-    else:
-        use_triton = True
+    use_triton = _aiter_w8a8_use_triton(n, k, input_2d.shape[0])
 
     # if input_scale not None, input is quanted
     if input_scale is not None:

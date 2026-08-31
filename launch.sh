@@ -13,6 +13,7 @@ exec env SGLANG_DSV4_FP4_DEQUANT=1 sglang serve \
   --served-model-name DeepSeek-V4-Flash-0731 \
   --tp 8 \
   --moe-runner-backend auto \
+  --fp8-gemm-backend aiter \
   --attention-backend dsv4 \
   --page-size 256 \
   --mem-fraction-static 0.90 \

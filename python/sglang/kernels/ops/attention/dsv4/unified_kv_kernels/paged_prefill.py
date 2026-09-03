@@ -253,7 +253,8 @@ def _sparse_attn_v4_paged_prefill_triton(
 
     block_h = 16  # AMD MFMA min tile
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
+    # block_k = 16 if D >= 256 else 32
+    block_k = 32
     _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
         q,
         unified_kv,
@@ -280,7 +281,8 @@ def _sparse_attn_v4_paged_prefill_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        num_warps=8,
+        num_warps=4,
+        num_stages=1,
     )
     return out
 

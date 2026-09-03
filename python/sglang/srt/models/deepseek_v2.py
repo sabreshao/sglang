@@ -790,9 +790,10 @@ class DeepseekV2MoE(nn.Module):
                 if (
                     _use_aiter
                     and config.quantization_config.get("quant_method")
-                    == "compressed-tensors"
+                    in ("compressed-tensors", "w8a8_fp8")
                 ):
-                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    # PTPC-PATCH: compressed-tensors/w8a8_fp8 are per-channel
+                    # (PTPC); no weight_block_size to check -- leave it None.
                     pass
                 else:
                     assert (

@@ -98,9 +98,34 @@ def resolve_runtime_config(
         gamma = dspark_gamma_from_num_draft_tokens(int(speculative_num_draft_tokens))
         config_gamma = draft_config.resolve_gamma(default=None)
         if config_gamma is not None and int(config_gamma) != gamma:
+            # gamma > native block_size is UNSAFE: the DSpark draft model and its
+            # ragged-verify window are trained/shaped for the checkpoint's native
+            # block_size. Running a wider gamma feeds out-of-distribution draft
+            # positions into a verify path that reshapes target logits by the
+            # runtime width, mis-aligning accept decisions -> non-deterministic
+            # token acceptance, repetition loops, and missed EOS (never a warning
+            # before this guard). Reject it so a mismatched server cannot boot.
+            if int(gamma) > int(config_gamma):
+                raise ValueError(
+                    "DSpark gamma mismatch: requested gamma=%s (from "
+                    "speculative_num_draft_tokens=%s) exceeds the draft "
+                    "checkpoint's native block_size=%s. gamma > native block_size "
+                    "corrupts ragged-verify acceptance (runaway/repetition). Set "
+                    "--speculative-num-draft-tokens to native+1 (=%s) or the "
+                    "matching --speculative-dspark-block-size=%s."
+                    % (
+                        gamma,
+                        speculative_num_draft_tokens,
+                        config_gamma,
+                        int(config_gamma) + 1,
+                        config_gamma,
+                    )
+                )
+            # gamma < native is a safe, intentional reduction; warn only.
             logger.warning(
                 "DSpark gamma mismatch: using gamma=%s (from "
-                "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
+                "speculative_num_draft_tokens=%s) but draft config block_size=%s "
+                "(gamma < native is allowed but leaves draft capacity unused).",
                 gamma,
                 speculative_num_draft_tokens,
                 config_gamma,

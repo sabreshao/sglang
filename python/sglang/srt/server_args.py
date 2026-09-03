@@ -5319,7 +5319,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+                if os.environ.get("SGLANG_GFX942_FORCE_MULTI_STREAM", "0") != "1":
+                    envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
         elif model_arch in ["GptOssForCausalLM"]:

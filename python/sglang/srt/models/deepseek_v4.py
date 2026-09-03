@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -3071,10 +3072,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     cache_compressor_weight.pop(key)
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wq_a.weight_scale_inv")
                                 or name.endswith(".wkv.weight")
+                                or name.endswith(".wkv.weight_scale")
                                 or name.endswith(".wkv.weight_scale_inv")
                             ):
+                                # TierA A3 fix: the stock fusion only carried the
+                                # block-scale (.weight_scale_inv); the PTPC
+                                # per-channel (.weight_scale) fell through to the
+                                # generic branch, was not remapped to .wqkv_a., was
+                                # absent from params_dict, and got silently dropped
+                                # -> fused wqkv_a ran with uninitialized scales.
+                                # Per-channel weight scales are indexed per OUTPUT
+                                # row, so the fused scale is exactly the row-wise
+                                # concat of the constituents in the SAME q-then-kv
+                                # order as the fused weight (no re-derivation).
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
                                     ".wq_a." if is_q else ".wkv.", ".wqkv_a."
@@ -3102,6 +3115,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_wqkv_a_weight.pop(param_name)
+                                    if os.environ.get("TIERA_A3_LOG") == "1":
+                                        logger.info(
+                                            f"[TierA-A3] fused {param_name} "
+                                            f"q{tuple(bucket['q'].shape)}+"
+                                            f"kv{tuple(bucket['kv'].shape)}"
+                                            f"->{tuple(fused_weight.shape)}"
+                                        )
                             else:
                                 if (
                                     "k_scale" in name or "v_scale" in name
@@ -3138,6 +3158,18 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+        if os.environ.get("TIERA_DUMP_LINEARS") == "1":
+            pk = params_dict.keys()
+            n_wqa = sum(1 for k in pk if k.endswith(".wq_a.weight"))
+            n_wkv = sum(1 for k in pk if k.endswith(".wkv.weight"))
+            n_fused = sum(1 for k in pk if k.endswith(".wqkv_a.weight"))
+            n_fused_sc = sum(1 for k in pk if k.endswith(".wqkv_a.weight_scale"))
+            logger.info(
+                f"[TierA-A3] qkv_a linear structure: wq_a={n_wqa} wkv={n_wkv} "
+                f"wqkv_a(fused)={n_fused} wqkv_a.weight_scale={n_fused_sc} "
+                f"-> qkv_a fp8-GEMM dispatches/decode-step = "
+                f"{n_wqa + n_wkv + n_fused} (was {n_wqa + n_wkv + 2 * n_fused} unfused)"
+            )
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = [

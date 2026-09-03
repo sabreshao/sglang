@@ -873,6 +873,24 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
 
         # Sampling info
+        # ng20 server-side default: bake the FIXED no-repeat n-gram block
+        # (NoRepeatNGramFixed, correct across all DSpark draft-token rows;
+        # ngram_size=20 / window_size=90) into every request WITHOUT requiring a
+        # per-request custom_logit_processor payload. Overridable: a request may
+        # supply its own custom_logit_processor, pass ngram_size/window_size in
+        # custom_params, or opt out via custom_params={"no_repeat_ngram": False}.
+        # Disable build-wide with env SGLANG_DEFAULT_NO_REPEAT_NGRAM=0.
+        from sglang.srt.sampling.custom_logit_processor import (
+            maybe_inject_default_ngram,
+        )
+
+        _dflt_clp, _dflt_cp = maybe_inject_default_ngram(
+            custom_logit_processor, sampling_params
+        )
+        if _dflt_clp is not None:
+            custom_logit_processor = _dflt_clp
+            sampling_params = copy.copy(sampling_params)
+            sampling_params.custom_params = _dflt_cp
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {

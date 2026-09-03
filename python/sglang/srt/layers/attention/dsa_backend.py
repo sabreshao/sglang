@@ -156,6 +156,85 @@ else:
     )
 
 
+from sglang.srt.utils import get_bool_env_var as _get_bool_env_var
+_DSA_A8W8 = _get_bool_env_var("SGLANG_DSA_A8W8")
+
+
+def _dsa_a8w8_ok(max_seqlen_q):
+    # a8w8 qh16 asm supports qseqlen in {1,2}; DSA extend is per-token (qseqlen=1).
+    return _DSA_A8W8 and max_seqlen_q is not None and int(max_seqlen_q) <= 2
+
+
+def _quant_q_fp8(q_bf16):
+    # per-tensor symmetric fp8 quant of the absorbed latent query (matches ref-diff harness).
+    _fmax = torch.finfo(fp8_dtype).max
+    q_scale = (q_bf16.detach().abs().amax() / _fmax).clamp_min(1e-6).to(torch.float32)
+    q_fp8 = (q_bf16 / q_scale).clamp(-_fmax, _fmax).to(fp8_dtype)
+    return q_fp8, q_scale
+
+
+def _mla_decode_fwd_grouped(
+    q,
+    kv_buffer,
+    o,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    **kwargs,
+):
+    # gfx942 aiter ships asm MLA decode kernels only for a limited set of gqa
+    # head counts (nhead in {16, 32}); the normal TP8 path uses 8->16. Under DSA
+    # prefill context-parallel attn_tp_size is forced to 1, so each rank holds
+    # all 64 heads and the asm kernel aborts:
+    #   asm_mla.cu get_heuristic_kernel_mla: cannot get heuristic kernel! gqa:64
+    # MLA shares a single latent KV across all heads, so attention is independent
+    # per head. Splitting the 64-head call into 4 groups of 16 is mathematically
+    # exact and reuses the known-good gqa:16 kernel. Only triggers for bf16 KV
+    # with nhead a multiple of 16 and > 32; every other case (incl. fp8 and the
+    # normal nhead<=32 path) calls the kernel directly with unchanged behavior.
+    nhead = q.shape[1]
+    GROUP = 16
+    can_split = (
+        nhead > 32
+        and nhead % GROUP == 0
+        and q.dtype == kv_buffer.dtype
+        and q.dtype in (torch.bfloat16, fp8_dtype)
+    )
+    if not can_split:
+        return mla_decode_fwd(
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            **kwargs,
+        )
+    for g in range(nhead // GROUP):
+        sl = slice(g * GROUP, (g + 1) * GROUP)
+        q_g = q[:, sl, :].contiguous()
+        o_g = torch.empty(
+            (o.shape[0], GROUP, o.shape[2]), dtype=o.dtype, device=o.device
+        )
+        mla_decode_fwd(
+            q_g,
+            kv_buffer,
+            o_g,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            **kwargs,
+        )
+        o[:, sl, :] = o_g
+    return o
+
+
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
     # Always normalize to (N_total, 1) layout, to avoid deadlock at deep_gemm.fp8_paged_mqa_logits
     if seqlens_32.dim() == 2:
@@ -358,6 +437,9 @@ class DeepseekSparseAttnBackend(
                 max_bs * self.dsa_index_topk,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            self._fp8_dequant_arange = torch.arange(
+                max_bs * self.dsa_index_topk, dtype=torch.int32, device=self.device
             )
             # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
             # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
@@ -851,19 +933,36 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
-            if forward_batch.extend_prefix_lens_cpu is None:
-                assert forward_batch.extend_prefix_lens is not None
-                forward_batch.extend_prefix_lens_cpu = (
-                    forward_batch.extend_prefix_lens.cpu().tolist()
-                )
+            # EAGLE-v2 draft-extend: base_spec_worker.prepare_for_draft_extend advances
+            # seq_lens by +num_draft_tokens and sets extend_seq_lens_cpu, but leaves the
+            # extend_seq_lens tensor / extend_prefix_lens_cpu / extend_num_tokens unset on
+            # forward_batch, which tripped the original "All of them must not be None"
+            # assertion. Derive them here the same way the cuda-graph capture path does:
+            # every request extends by the full padded tree width (num_draft_tokens), a
+            # static shape like target-verify. Guarded to draft_extend_v2 only so the
+            # normal target/extend paths are unaffected.
+            _ndt = self.speculative_num_draft_tokens
             if forward_batch.seq_lens_cpu is None:
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
-                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-            assert (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+                # The DSA backend opts out of the host seq_lens mirror
+                # (needs_cpu_seq_lens=False), but the DSA indexer's eager
+                # forward_cuda hard-requires forward_batch.seq_lens_cpu in this
+                # draft-extend path. seq_lens already includes the draft KV
+                # (advanced by prepare_for_draft_extend), so mirror it to host.
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.to("cpu")
+            if forward_batch.extend_seq_lens is None:
+                forward_batch.extend_seq_lens = torch.full(
+                    (batch_size,), _ndt, dtype=torch.int32, device=device
+                )
+            if forward_batch.extend_seq_lens_cpu is None:
+                forward_batch.extend_seq_lens_cpu = [_ndt] * batch_size
+            if forward_batch.extend_num_tokens is None:
+                forward_batch.extend_num_tokens = batch_size * _ndt
+            if forward_batch.extend_prefix_lens_cpu is None:
+                forward_batch.extend_prefix_lens_cpu = (
+                    [int(s) - _ndt for s in forward_batch.seq_lens_cpu.tolist()]
+                    if forward_batch.seq_lens_cpu is not None
+                    else [0] * batch_size
+                )
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None
@@ -1012,6 +1111,43 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        # --- CP+EAGLE fix (gfx942 prefill context-parallel) ---
+        # Under prefill-CP the model pads the per-token count to a CP/DP-aligned
+        # size (and pad_dsa_cache_seqlens pads dsa_cache_seqlens to match), but
+        # seqlens_expanded -- the DSA indexer PAGED `lengths` (dsa_seqlens_expanded)
+        # -- is left unpadded. For the PAGED draft-extend (DRAFT_EXTEND_V2) / decode
+        # path this makes lengths.size(0) != logits B and crashes
+        # fast_topk_transform_fused ("Expected lengths.size(0) == B"). Pad
+        # seqlens_expanded with zeros (the same fill pad_dsa_cache_seqlens uses) so
+        # `lengths` matches the padded per-token logits; padded rows are dummy
+        # padding tokens whose indexer output is discarded. Guarded to PAGED + a
+        # genuine size mismatch, so RAGGED extend and the non-CP / unpadded paths
+        # are untouched (no-op when sizes already agree).
+        # NOTE: pad only for the PAGED-consumer forward modes. get_topk_transform_method
+        # returns PAGED for the aiter config even for context_parallel_extend, but the
+        # indexer dispatch routes context_parallel_extend to _get_topk_ragged, which
+        # requires UNPADDED seqlens_expanded (== logits rows). Padding it there breaks
+        # `assert logits.shape[0] == len(seq_lens_expanded)`. So gate on the actual
+        # PAGED-consumed modes (decode/target_verify/draft_extend_v2) that _get_topk_paged
+        # handles; the ragged extend stays unpadded (and CP round-robin-splits it
+        # consistently with its logits when seq_len >= cp_size).
+        _paged_consumer = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        if (
+            _paged_consumer
+            and seqlens_expanded.shape[0] < dsa_cache_seqlens_int32.shape[0]
+        ):
+            seqlens_expanded = torch.cat(
+                [
+                    seqlens_expanded,
+                    seqlens_expanded.new_zeros(
+                        dsa_cache_seqlens_int32.shape[0] - seqlens_expanded.shape[0]
+                    ),
+                ]
+            )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -2964,11 +3100,10 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        _kv_is_fp8 = kv_cache.dtype == fp8_dtype
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
@@ -2980,24 +3115,30 @@ class DeepseekSparseAttnBackend(
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         kv_last_page_lens = metadata.cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                metadata.cu_seqlens_q,
-                kv_indptr,
-                bs,
-                metadata.max_seq_len_q,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
-        mla_decode_fwd(
+        # fp8-KV dequant-on-read (gfx942, decode): gather only the top-k keys
+        # (bs*index_topk, fixed -> cuda-graph safe), upcast fp8->bf16 (raw store scale
+        # 1.0), run the validated bf16 mla_decode_fwd with sequential indices.
+        kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
+        kv_indices_for_kernel = kv_indices
+        if _kv_is_fp8 and _dsa_a8w8_ok(metadata.max_seq_len_q):
+            # native a8w8: fp8 Q + fp8 KV directly (no gather/upcast); real sparse indices.
+            q_kernel, q_scale = _quant_q_fp8(q_kernel)
+            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+        elif _kv_is_fp8:
+            q_kernel = q_kernel.to(torch.bfloat16)
+            _n = bs * self.dsa_index_topk
+            _g = kv_cache.view(-1, layer.head_dim)[kv_indices[:_n]].to(torch.bfloat16)
+            kv_buffer_for_kernel = _g.view(-1, 1, 1, layer.head_dim)
+            kv_indices_for_kernel = self._fp8_dequant_arange[:_n]
+
+        _mla_decode_fwd_grouped(
             q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
+            kv_buffer_for_kernel,
             o_kernel,
             metadata.cu_seqlens_q,
             kv_indptr,
-            kv_indices,
+            kv_indices_for_kernel,
             kv_last_page_lens,
             metadata.max_seq_len_q,
             sm_scale=layer.scaling,
@@ -3042,11 +3183,10 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        _kv_is_fp8 = kv_cache.dtype == fp8_dtype
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -3068,25 +3208,40 @@ class DeepseekSparseAttnBackend(
             0, num_tokens + 1, dtype=torch.int32, device=self.device
         )
         kv_last_page_lens = cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
+
+        # fp8-KV dequant-on-read (gfx942, extend). EAGLE target-verify / draft-extend
+        # run this EVERY decode step over all layers with small num_tokens, so gather
+        # only the top-k keys (num_tokens*topk fixed -> graph safe) and upcast fp8->bf16
+        # instead of dequanting the full pool (that was the ~15x EAGLE decode slowdown).
+        # Real prefill chunks have large num_tokens (gather > pool) -> full-pool upcast.
+        kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
+        kv_indices_for_kernel = kv_indices
+        if _kv_is_fp8 and _dsa_a8w8_ok(1):
+            # native a8w8: fp8 Q + fp8 KV directly (extend is per-token, qseqlen=1).
+            q_kernel, q_scale = _quant_q_fp8(q_kernel)
+            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+        elif _kv_is_fp8:
+            q_kernel = q_kernel.to(torch.bfloat16)
+            _pool = kv_cache.view(-1, layer.head_dim).shape[0]
+            if num_tokens * topk <= _pool:
+                _g = kv_cache.view(-1, layer.head_dim)[kv_indices].to(torch.bfloat16)
+                kv_buffer_for_kernel = _g.view(-1, 1, 1, layer.head_dim)
+                kv_indices_for_kernel = torch.arange(
+                    num_tokens * topk, dtype=torch.int32, device=self.device
+                )
+            else:
+                kv_buffer_for_kernel = kv_cache.to(torch.bfloat16).view(
+                    -1, 1, 1, layer.head_dim
+                )
 
         # TODO support more forward_mode
-        mla_decode_fwd(
+        _mla_decode_fwd_grouped(
             q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
+            kv_buffer_for_kernel,
             o_kernel,
             cu_seqlens_q,
             kv_indptr,
-            kv_indices,
+            kv_indices_for_kernel,
             kv_last_page_lens,
             1,  # max_seq_len_q = 1 for per-token attention
             sm_scale=layer.scaling,
@@ -3480,13 +3635,17 @@ class DeepseekSparseAttnMultiStepBackend:
             forward_mode=ForwardMode.DECODE,
         )
 
-        # Use multi-backend fused copy when we have 3 or more backends
-        # This is 3x faster than calling the single-backend copy 3 times
-        if self.speculative_num_steps > 3:
-            try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
-                    fused_metadata_copy_multi_cuda,
-                )
+            # Use multi-backend fused copy when we have 3 or more backends
+            # This is 3x faster than calling the single-backend copy 3 times
+            # NOTE(hip-fix): the multi-backend fused metadata-copy HIP kernel faults the
+            # GPU (fused copies are unvalidated on ROCm; the single-backend path is
+            # already gated by _USE_FUSED_METADATA_COPY == not _is_hip). Gate this path
+            # the same way so HIP falls back to the per-backend loop below.
+            if _USE_FUSED_METADATA_COPY and self.speculative_num_steps > 3:
+                try:
+                    from sglang.jit_kernel.fused_metadata_copy import (
+                        fused_metadata_copy_multi_cuda,
+                    )
 
                 metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
                 metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]

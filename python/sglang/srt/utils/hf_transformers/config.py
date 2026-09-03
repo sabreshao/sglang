@@ -138,8 +138,15 @@ class HfModelConfigParser(ModelConfigParserBase):
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
                 model_type = "deepseek-ocr"
+            _reload_kwargs = {}
+            if kwargs.get("_configuration_file") is not None:
+                # Honor --decrypted-draft-config-file (and any _configuration_file
+                # override) across the registry reload; without this the override
+                # applied by AutoConfig.from_pretrained is silently dropped for
+                # registered model_types (e.g. deepseek_v4).
+                _reload_kwargs["_configuration_file"] = kwargs["_configuration_file"]
             config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                model, revision=revision
+                model, revision=revision, **_reload_kwargs
             )
 
             # Re-check after reloading config from registry

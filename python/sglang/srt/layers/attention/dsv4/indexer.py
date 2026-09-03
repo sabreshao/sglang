@@ -32,6 +32,9 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.triton_mqa_logits import (
+    triton_fp8_paged_mqa_logits,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -709,6 +712,8 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
+        elif envs.SGLANG_OPT_USE_TRITON_MQA_INDEXER.get():
+            fn = triton_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if is_sm120_supported():
                 fn = fp8_paged_mqa_logits_torch_sm120

@@ -535,6 +535,12 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # EPLB+EAGLE: the NextN draft MoE calls this outside the layer-idx context
+        # (layer_idx=None), which makes self._data[layer_idx,:] 2-D and breaks
+        # scatter_add_. Skip untracked/draft layers; EPLB rebalances only the target
+        # model's routed experts. [eplb draft fix]
+        if not isinstance(layer_idx, int) or not (0 <= layer_idx < self._data.shape[0]):
+            return
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(

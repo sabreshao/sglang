@@ -1,4 +1,5 @@
 import json
+import os
 from abc import ABC, abstractmethod
 from array import array
 from functools import lru_cache
@@ -201,3 +202,226 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+def _spec_ntok(logits, n):
+    try:
+        nt = logits.shape[0] // n
+        return nt if nt >= 1 else 1
+    except Exception:
+        return 1
+
+
+class NoRepeatNGramFixed(CustomLogitProcessor):
+    """Sliding-window n-gram ban, correct across all spec rows. Opt-in via ngram_size."""
+
+    def __call__(self, logits, custom_param_list=None):
+        if not custom_param_list:
+            return logits
+        from array import array as _arr
+
+        nreq = len(custom_param_list)
+        ntok = _spec_ntok(logits, nreq)
+        for j, params in enumerate(custom_param_list):
+            if not params:
+                continue
+            req = params.get("__req__")
+            if req is None:
+                continue
+            ng = int(params.get("ngram_size") or 0)
+            win = int(params.get("window_size") or 0)
+            if ng <= 0 or win <= 0:
+                continue
+            seq = req.origin_input_ids + req.output_ids
+            if len(seq) < ng:
+                continue
+            start = max(0, len(seq) - win)
+            end = len(seq) - ng + 1
+            if end <= start:
+                continue
+            prefix = seq[-(ng - 1):] if ng > 1 else _arr("q")
+            banned = set()
+            for idx in range(start, end):
+                gram = seq[idx: idx + ng]
+                if ng == 1 or gram[:-1] == prefix:
+                    banned.add(gram[-1])
+            wl = params.get("whitelist_token_ids") or []
+            banned.difference_update(int(t) for t in wl)
+            if not banned:
+                continue
+            logits[j * ntok:(j + 1) * ntok, list(banned)] = -float("inf")
+        return logits
+
+
+class DRYLogitProcessor(CustomLogitProcessor):
+    """DRY variable-length repetition penalty (long-period loops). Opt-in via dry_multiplier."""
+
+    def __call__(self, logits, custom_param_list=None):
+        if not custom_param_list:
+            return logits
+        nreq = len(custom_param_list)
+        ntok = _spec_ntok(logits, nreq)
+        for j, params in enumerate(custom_param_list):
+            if not params or "dry_multiplier" not in params:
+                continue
+            req = params.get("__req__")
+            if req is None:
+                continue
+            mult = float(params.get("dry_multiplier") or 0.0)
+            if mult <= 0.0:
+                continue
+            base = float(params.get("dry_base", 1.75) or 1.75)
+            allowed = int(params.get("dry_allowed_length", 2) or 2)
+            rng = int(params.get("dry_range", 2048) or 2048)
+            breakers = set(params.get("dry_sequence_breaker_ids") or [])
+            seq = list(req.origin_input_ids) + list(req.output_ids)
+            n = len(seq)
+            if n < 2:
+                continue
+            m = min(rng, n)
+            w = seq[n - m:]
+            last = w[-1]
+            if last in breakers:
+                continue
+            L = len(w)
+            best = {}
+            for i in range(L - 1):
+                if w[i] != last:
+                    continue
+                match = 1
+                while (match <= i and match <= L - 1
+                       and w[i - match] == w[L - 1 - match]
+                       and w[i - match] not in breakers):
+                    match += 1
+                nxt = w[i + 1]
+                if match > best.get(nxt, 0):
+                    best[nxt] = match
+            r0, r1 = j * ntok, (j + 1) * ntok
+            for tok, ml in best.items():
+                if ml >= allowed:
+                    expo = min(ml - allowed, 30)  # cap: base**expo can overflow float
+                    logits[r0:r1, tok] -= mult * (base ** expo)
+        return logits
+
+
+class EntropyCollapseLogitProcessor(CustomLogitProcessor):
+    """Confidence-collapse early-stop (force EOS). Opt-in via ent_enable."""
+
+    def __call__(self, logits, custom_param_list=None):
+        if not custom_param_list:
+            return logits
+        import torch as _torch
+
+        nreq = len(custom_param_list)
+        ntok = _spec_ntok(logits, nreq)
+        for j, params in enumerate(custom_param_list):
+            if not params or not params.get("ent_enable"):
+                continue
+            req = params.get("__req__")
+            if req is None:
+                continue
+            window = int(params.get("ent_window", 128) or 128)
+            thr = float(params.get("ent_threshold", 0.35) or 0.35)
+            min_tokens = int(params.get("ent_min_tokens", 1200) or 1200)
+            eos_ids = params.get("eos_token_ids") or [1]
+            r0 = j * ntok
+            with _torch.no_grad():
+                logp = _torch.log_softmax(logits[r0].float(), dim=-1)
+                ent = float(-(logp.exp() * logp).sum().item())
+            hist = getattr(req, "_ent_hist", None)
+            if hist is None:
+                hist = []
+                try:
+                    req._ent_hist = hist
+                except Exception:
+                    pass
+            hist.append(ent)
+            if len(hist) > window:
+                del hist[: len(hist) - window]
+            if len(req.output_ids) >= min_tokens and len(hist) >= window and max(hist) < thr:
+                logits[r0:r0 + ntok, :] = -float("inf")
+                for e in eos_ids:
+                    logits[r0:r0 + ntok, int(e)] = 0.0
+        return logits
+
+
+class LoopGuardLogitProcessor(CustomLogitProcessor):
+    """Composition: (fixed) no-repeat-ngram + DRY + entropy-collapse; each opt-in."""
+
+    _ngram = NoRepeatNGramFixed()
+    _dry = DRYLogitProcessor()
+    _ent = EntropyCollapseLogitProcessor()
+
+    def __call__(self, logits, custom_param_list=None):
+        logits = self._ngram(logits, custom_param_list)
+        logits = self._dry(logits, custom_param_list)
+        logits = self._ent(logits, custom_param_list)
+        return logits
+
+
+# === ng20 baked-in server-side default ===
+# Bake the FIXED no-repeat n-gram block (NoRepeatNGramFixed, correct across all
+# DSpark draft-token rows) into every request as a server-side default, so the
+# client no longer has to attach a per-request custom_logit_processor payload.
+# Defaults: ngram_size=20, window_size=90. Fully overridable per request (see
+# maybe_inject_default_ngram below). Disable build-wide with env
+# SGLANG_DEFAULT_NO_REPEAT_NGRAM=0.
+DEFAULT_NO_REPEAT_NGRAM_SIZE = 20
+DEFAULT_NO_REPEAT_WINDOW_SIZE = 90
+
+
+def _default_ngram_enabled() -> bool:
+    return os.environ.get("SGLANG_DEFAULT_NO_REPEAT_NGRAM", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    )
+
+
+@lru_cache(maxsize=1)
+def _default_ngram_clp_str() -> str:
+    """Serialized NoRepeatNGramFixed processor (cached)."""
+    return NoRepeatNGramFixed.to_str()
+
+
+def maybe_inject_default_ngram(custom_logit_processor, sampling_params):
+    """Compute the ng20 server-side default for a request.
+
+    Returns ``(clp_str, custom_params_dict)`` when the default no-repeat n-gram
+    block should be applied, or ``(None, None)`` when it should NOT (i.e. the
+    request already handles it or opted out). The caller is responsible for
+    setting these onto the Req / SamplingParams.
+
+    Override / opt-out rules (all preserved):
+      * If the request already supplies its own ``custom_logit_processor`` ->
+        no-op (full override, the request's processor wins).
+      * If disabled build-wide via ``SGLANG_DEFAULT_NO_REPEAT_NGRAM=0`` -> no-op.
+      * If the request passes ``custom_params={"no_repeat_ngram": False}`` -> no-op.
+      * If the request passes ``custom_params={"ngram_size": <=0}`` -> no-op.
+      * If the request passes its own ``ngram_size`` / ``window_size`` in
+        ``custom_params``, those values are respected (defaults only fill gaps).
+    """
+    if custom_logit_processor is not None:
+        return None, None
+    if not _default_ngram_enabled():
+        return None, None
+    cp = sampling_params.custom_params
+    if cp is None:
+        cp = {}
+    elif not isinstance(cp, dict):
+        return None, None
+    if cp.get("no_repeat_ngram") is False:
+        return None, None
+    ng = cp.get("ngram_size")
+    if ng is not None:
+        try:
+            if int(ng) <= 0:
+                return None, None
+        except (TypeError, ValueError):
+            return None, None
+    merged = dict(cp)
+    merged.setdefault("ngram_size", DEFAULT_NO_REPEAT_NGRAM_SIZE)
+    merged.setdefault("window_size", DEFAULT_NO_REPEAT_WINDOW_SIZE)
+    return _default_ngram_clp_str(), merged
